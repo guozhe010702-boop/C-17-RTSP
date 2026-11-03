@@ -1,6 +1,8 @@
 #include "rkstream/v4l2_capture.h"
 
 #include "rkstream/pixel_format.h"
+#include "rkstream/nv12_payload.h"
+#include "rkstream/scope_exit.h"
 
 #include <linux/videodev2.h>
 
@@ -127,9 +129,15 @@ bool V4L2Capture::open(const CaptureConfig& config, std::string* error) {
         info_.height = format.fmt.pix_mp.height;
         info_.pixel_format = format.fmt.pix_mp.pixelformat;
         info_.plane_count = format.fmt.pix_mp.num_planes;
+        if (info_.plane_count == 0 || info_.plane_count > VIDEO_MAX_PLANES) {
+            if (error) *error = "driver returned an invalid plane count";
+            close();
+            return false;
+        }
         info_.bytes_per_line = format.fmt.pix_mp.plane_fmt[0].bytesperline;
         info_.size_image = 0;
         for (uint32_t plane = 0; plane < info_.plane_count; ++plane) {
+            info_.plane_strides.push_back(format.fmt.pix_mp.plane_fmt[plane].bytesperline);
             info_.size_image += format.fmt.pix_mp.plane_fmt[plane].sizeimage;
         }
     } else {
@@ -139,6 +147,7 @@ bool V4L2Capture::open(const CaptureConfig& config, std::string* error) {
         info_.plane_count = 1;
         info_.bytes_per_line = format.fmt.pix.bytesperline;
         info_.size_image = format.fmt.pix.sizeimage;
+        info_.plane_strides.push_back(info_.bytes_per_line);
     }
 
     if (info_.plane_count == 0 || info_.plane_count > VIDEO_MAX_PLANES) {
@@ -159,6 +168,7 @@ bool V4L2Capture::open(const CaptureConfig& config, std::string* error) {
 
     // 3. 请求帧率并用 G_PARM 读回。摄像头声明/协商 30 FPS 不代表真实一定 30；
     //    最终性能仍以驱动 timestamp 和实测 elapsed 为准。
+    info_.requested_fps = config.fps;
     v4l2_streamparm stream_parameters{};
     stream_parameters.type = buffer_type();
     stream_parameters.parm.capture.timeperframe.numerator = 1;
@@ -171,8 +181,9 @@ bool V4L2Capture::open(const CaptureConfig& config, std::string* error) {
         stream_parameters.parm.capture.timeperframe.numerator != 0) {
         info_.fps_numerator = stream_parameters.parm.capture.timeperframe.denominator;
         info_.fps_denominator = stream_parameters.parm.capture.timeperframe.numerator;
+        info_.fps_reported = true;
     } else {
-        info_.fps_numerator = config.fps;
+        info_.fps_numerator = 0;  // Unknown is not the requested FPS.
         info_.fps_denominator = 1;
     }
 
@@ -334,6 +345,14 @@ CaptureResult V4L2Capture::capture(Frame* frame, int timeout_ms, std::string* er
         return CaptureResult::kFatal;
     }
 
+    auto requeue = [&] { (void)queue_buffer(buffer.index, nullptr); };
+    ScopeExit<decltype(requeue)> guard(requeue);
+    if ((buffer.flags & V4L2_BUF_FLAG_ERROR) ||
+        (info_.multi_planar && buffer.length != info_.plane_count)) {
+        if (error) *error = "driver returned an erroneous frame or inconsistent plane count";
+        return CaptureResult::kFatal;
+    }
+
     frame->sequence = buffer.sequence;
     frame->driver_timestamp_us = static_cast<uint64_t>(buffer.timestamp.tv_sec) * 1'000'000ULL +
                                  static_cast<uint64_t>(buffer.timestamp.tv_usec);
@@ -349,31 +368,32 @@ CaptureResult V4L2Capture::capture(Frame* frame, int timeout_ms, std::string* er
     // CPU-copy 基线的核心：先计算有效字节总量，再复制每个 V4L2 plane。
     // bytesused 为 0 时才退回映射长度，且始终检查驱动值不超过 mmap 长度。
     const auto& mapping = buffers_[buffer.index];
-    std::size_t total_bytes = 0;
+    std::vector<PlanePayload> payloads;
     for (uint32_t plane = 0; plane < mapping.planes.size(); ++plane) {
         const std::size_t used = info_.multi_planar ? planes[plane].bytesused : buffer.bytesused;
-        total_bytes += used > 0 ? used : mapping.planes[plane].length;
+        payloads.push_back({static_cast<const std::byte*>(mapping.planes[plane].address),
+                           mapping.planes[plane].length, used,
+                           info_.multi_planar ? planes[plane].data_offset : 0,
+                           info_.plane_strides[plane]});
     }
-    frame->data.reserve(total_bytes);
-    for (uint32_t plane = 0; plane < mapping.planes.size(); ++plane) {
-        const auto& mapped_plane = mapping.planes[plane];
-        std::size_t used = info_.multi_planar ? planes[plane].bytesused : buffer.bytesused;
-        if (used == 0) {
-            used = mapped_plane.length;
-        }
-        if (used > mapped_plane.length) {
-            if (error != nullptr) {
-                *error = "driver reported bytesused larger than mapped buffer";
-            }
-            (void)queue_buffer(buffer.index, nullptr);
+    if (info_.pixel_format == V4L2_PIX_FMT_NV12 || info_.pixel_format == V4L2_PIX_FMT_NV12M) {
+        if (!copy_nv12_payload(payloads, info_.width, info_.height, &frame->data, error))
             return CaptureResult::kFatal;
+    } else {
+        for (const auto& plane : payloads) {
+            const auto used = plane.bytes_used ? plane.bytes_used : plane.length;
+            if (used > plane.length || plane.data_offset > used) {
+                if (error) *error = "invalid plane bytesused/data_offset";
+                return CaptureResult::kFatal;
+            }
+            frame->data.insert(frame->data.end(), plane.data + plane.data_offset, plane.data + used);
         }
-        const auto* begin = static_cast<const std::byte*>(mapped_plane.address);
-        frame->data.insert(frame->data.end(), begin, begin + used);
     }
 
     // 像素已经由 Frame::data 独立拥有，可以立即把原始 slot 归还驱动。
-    if (!queue_buffer(buffer.index, error)) {
+    const bool queued = queue_buffer(buffer.index, error);
+    guard.dismiss();
+    if (!queued) {
         return CaptureResult::kFatal;
     }
     return CaptureResult::kFrame;

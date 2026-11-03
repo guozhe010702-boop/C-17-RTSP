@@ -3,6 +3,7 @@
 #include "rkstream/v4l2_capture.h"
 
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -61,10 +62,13 @@ public:
 
     const CaptureInfo& info() const { return info_; }
     const std::vector<DmabufBufferInfo>& buffers() const { return exported_buffers_; }
+    uint64_t released_count() const { return released_count_.load(); }
+    uint64_t release_failures() const { return release_failures_.load(); }
 
 private:
     static int ioctl_retry(int fd, unsigned long request, void* argument);
     bool queue_buffer(uint32_t index, std::string* error);
+    bool queue_buffer_locked(uint32_t index, std::string* error);
 
     int fd_ = -1;
     bool streaming_ = false;
@@ -77,6 +81,49 @@ private:
     // capture thread 执行 DQBUF，encode thread 在 RGA 完成后执行 QBUF；
     // 同一个 V4L2 fd 上的 ioctl 和 queued_ 状态必须串行化。
     std::mutex ioctl_mutex_;
+    std::atomic<uint64_t> released_count_{0};
+    std::atomic<uint64_t> release_failures_{0};
+};
+
+// A move-only lease: destruction, rejected push and dropped queue items all
+// return the camera slot. The capture owner MUST outlive every lease/queue.
+// Function pointer + context permit ownership tests without a real V4L2 fd;
+// no std::function allocation is added to the per-frame path.
+class DmabufFrameLease : public DmabufFrame {
+public:
+    using Release = bool (*)(void*, const DmabufFrame&, std::string*);
+    DmabufFrameLease() = default;
+    DmabufFrameLease(DmabufFrame frame, void* owner, Release callback)
+        : DmabufFrame(frame), owner_(owner), callback_(callback) {}
+    DmabufFrameLease(V4L2DmabufCapture& owner, DmabufFrame frame)
+        : DmabufFrameLease(frame, &owner, [](void* p, const DmabufFrame& f, std::string* e) {
+              return static_cast<V4L2DmabufCapture*>(p)->release(f, e);
+          }) {}
+    ~DmabufFrameLease() noexcept { reset(); }
+    DmabufFrameLease(const DmabufFrameLease&) = delete;
+    DmabufFrameLease& operator=(const DmabufFrameLease&) = delete;
+    DmabufFrameLease(DmabufFrameLease&& other) noexcept { take(other); }
+    DmabufFrameLease& operator=(DmabufFrameLease&& other) noexcept {
+        if (this != &other) { reset(); take(other); }
+        return *this;
+    }
+    bool release(std::string* error = nullptr) {
+        if (!owner_) return true;
+        void* owner = owner_;
+        owner_ = nullptr;
+        return callback_(owner, *this, error);
+    }
+    bool owns_buffer() const noexcept { return owner_ != nullptr; }
+private:
+    void reset() noexcept { try { (void)release(); } catch (...) {} }
+    void take(DmabufFrameLease& other) noexcept {
+        static_cast<DmabufFrame&>(*this) = other;
+        owner_ = other.owner_;
+        callback_ = other.callback_;
+        other.owner_ = nullptr;
+    }
+    void* owner_ = nullptr;
+    Release callback_ = nullptr;
 };
 
 }  // namespace rkstream

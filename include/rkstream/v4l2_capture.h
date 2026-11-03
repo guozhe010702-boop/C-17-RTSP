@@ -35,6 +35,9 @@ struct CaptureInfo {
     uint32_t plane_count = 0;
     uint32_t buffer_count = 0;
     bool multi_planar = false;
+    uint32_t requested_fps = 0;
+    bool fps_reported = false;
+    std::vector<uint32_t> plane_strides;
 };
 
 // capture() 将“暂时没帧”和“设备致命错误”分开，调用者可正确决定重试或退出。

@@ -8,6 +8,8 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <sstream>
@@ -50,6 +52,8 @@ public:
             close();
             return false;
         }
+        format_context_->interrupt_callback = {&Impl::interrupt, this};
+        format_context_->flags |= AVFMT_FLAG_FLUSH_PACKETS;
 
         stream_ = avformat_new_stream(format_context_, nullptr);
         if (stream_ == nullptr) {
@@ -90,6 +94,7 @@ public:
         av_dict_set(&options, "rw_timeout", "5000000", 0);
 
         if ((format_context_->oformat->flags & AVFMT_NOFILE) == 0) {
+            begin_io();
             result = avio_open2(&format_context_->pb, config.url.c_str(), AVIO_FLAG_WRITE,
                                nullptr, &options);
             if (result < 0) {
@@ -102,7 +107,9 @@ public:
             }
         }
 
+        begin_io();
         result = avformat_write_header(format_context_, &options);
+        deadline_ms_ = 0;
         av_dict_free(&options);
         if (result < 0) {
             if (error != nullptr) {
@@ -160,7 +167,9 @@ public:
             packet->flags |= AV_PKT_FLAG_KEY;
         }
 
+        begin_io();
         const int result = av_interleaved_write_frame(format_context_, packet);
+        deadline_ms_ = 0;
         av_packet_free(&packet);
         if (result < 0) {
             if (error != nullptr) {
@@ -175,7 +184,9 @@ public:
     void close() {
         // 先写 trailer，再关闭 AVIO，最后释放 format context；所有函数允许重复 close。
         if (format_context_ != nullptr && header_written_) {
+            begin_io();
             (void)av_write_trailer(format_context_);
+            deadline_ms_ = 0;
         }
         header_written_ = false;
         if (format_context_ != nullptr && format_context_->pb != nullptr &&
@@ -198,6 +209,16 @@ public:
     }
 
 private:
+    static int64_t now_ms() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    void begin_io() { deadline_ms_ = now_ms() + 5000; }
+    static int interrupt(void* opaque) {
+        const auto deadline = static_cast<Impl*>(opaque)->deadline_ms_.load();
+        return deadline && now_ms() >= deadline;
+    }
+    std::atomic<int64_t> deadline_ms_{0};
     RtspPublisherConfig config_;
     AVFormatContext* format_context_ = nullptr;
     AVStream* stream_ = nullptr;

@@ -33,6 +33,8 @@ std::string errno_message(const char* operation) {
 
 V4L2DmabufCapture::~V4L2DmabufCapture() {
     close();
+    released_count_ = 0;
+    release_failures_ = 0;
 }
 
 int V4L2DmabufCapture::ioctl_retry(int fd, unsigned long request, void* argument) {
@@ -108,10 +110,12 @@ bool V4L2DmabufCapture::open(const CaptureConfig& config, std::string* error) {
     info_.plane_count = format.fmt.pix_mp.num_planes;
     info_.bytes_per_line = format.fmt.pix_mp.plane_fmt[0].bytesperline;
     info_.size_image = format.fmt.pix_mp.plane_fmt[0].sizeimage;
-    if (info_.pixel_format != config.pixel_format || info_.plane_count != 1 ||
-        info_.bytes_per_line < info_.width) {
+    if (info_.pixel_format != V4L2_PIX_FMT_NV12 || info_.pixel_format != config.pixel_format ||
+        info_.plane_count != 1 || info_.bytes_per_line < info_.width ||
+        (info_.width & 1U) || (info_.height & 1U) ||
+        info_.size_image < static_cast<uint64_t>(info_.bytes_per_line) * info_.height * 3 / 2) {
         if (error != nullptr) {
-            *error = "driver returned unsupported DMA-BUF layout: format=" +
+            *error = "DMA/RGA requires contiguous NV12 with one memory plane; unsupported layout: format=" +
                      pixel_format_name(info_.pixel_format) +
                      " planes=" + std::to_string(info_.plane_count);
         }
@@ -119,6 +123,8 @@ bool V4L2DmabufCapture::open(const CaptureConfig& config, std::string* error) {
         return false;
     }
 
+    info_.requested_fps = config.fps;
+    info_.plane_strides.push_back(info_.bytes_per_line);
     v4l2_streamparm parameters{};
     parameters.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
     parameters.parm.capture.timeperframe.numerator = 1;
@@ -130,8 +136,9 @@ bool V4L2DmabufCapture::open(const CaptureConfig& config, std::string* error) {
         parameters.parm.capture.timeperframe.numerator != 0) {
         info_.fps_numerator = parameters.parm.capture.timeperframe.denominator;
         info_.fps_denominator = parameters.parm.capture.timeperframe.numerator;
+        info_.fps_reported = true;
     } else {
-        info_.fps_numerator = config.fps;
+        info_.fps_numerator = 0;
         info_.fps_denominator = 1;
     }
 
@@ -168,6 +175,11 @@ bool V4L2DmabufCapture::open(const CaptureConfig& config, std::string* error) {
             close();
             return false;
         }
+        if (query.length != 1 || planes[0].length < info_.size_image) {
+            if (error) *error = "QUERYBUF returned a truncated or non-contiguous DMA layout";
+            close();
+            return false;
+        }
 
         v4l2_exportbuffer export_buffer{};
         export_buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -191,6 +203,10 @@ bool V4L2DmabufCapture::queue_buffer(uint32_t index, std::string* error) {
     // capture 线程会 DQBUF，encode 线程会在 RGA 完成后 QBUF；两者共享同一个
     // V4L2 fd，所以 ioctl 和 queued_ 状态必须放在同一临界区中更新。
     std::lock_guard<std::mutex> lock(ioctl_mutex_);
+    return queue_buffer_locked(index, error);
+}
+
+bool V4L2DmabufCapture::queue_buffer_locked(uint32_t index, std::string* error) {
     if (index >= exported_buffers_.size()) {
         if (error != nullptr) {
             *error = "DMA-BUF index is out of range";
@@ -309,30 +325,42 @@ CaptureResult V4L2DmabufCapture::capture(DmabufFrame* frame, int timeout_ms,
         (V4L2_BUF_FLAG_TIMESTAMP_MASK | V4L2_BUF_FLAG_TSTAMP_SRC_MASK);
     frame->bytes_used = planes[0].bytesused > 0 ? planes[0].bytesused
                                                 : exported_buffers_[buffer.index].length;
-    if (frame->bytes_used > exported_buffers_[buffer.index].length) {
+    const auto required = static_cast<uint64_t>(info_.bytes_per_line) * info_.height * 3 / 2;
+    if (frame->bytes_used > exported_buffers_[buffer.index].length ||
+        frame->bytes_used < required || planes[0].data_offset != 0 ||
+        buffer.length != 1 || (buffer.flags & V4L2_BUF_FLAG_ERROR)) {
         if (error != nullptr) {
-            *error = "driver reported bytesused larger than exported DMA-BUF";
+            *error = "Invalid DMA payload: truncated/error frame or nonzero data_offset (not representable by RGA)";
         }
+        (void)queue_buffer(buffer.index, nullptr);
         return CaptureResult::kFatal;
     }
     return CaptureResult::kFrame;
 }
 
 bool V4L2DmabufCapture::release(const DmabufFrame& frame, std::string* error) {
+    std::lock_guard<std::mutex> lock(ioctl_mutex_);
     if (!streaming_ || frame.buffer_index >= queued_.size()) {
         if (error != nullptr) {
             *error = "invalid DMA-BUF frame release";
         }
+        ++release_failures_;
         return false;
     }
     if (queued_[frame.buffer_index]) {
         if (error != nullptr) {
             *error = "DMA-BUF frame was already released";
         }
+        ++release_failures_;
         return false;
     }
     // queue_buffer 是租约的唯一销毁点：queued_ 从 false 变 true。
-    return queue_buffer(frame.buffer_index, error);
+    if (!queue_buffer_locked(frame.buffer_index, error)) {
+        ++release_failures_;
+        return false;
+    }
+    ++released_count_;
+    return true;
 }
 
 void V4L2DmabufCapture::close() {

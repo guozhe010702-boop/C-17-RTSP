@@ -28,3 +28,7 @@ compile_commands.json
 .cache/
 .idea/
 .vscode/
+/local/
+/releases/
+__pycache__/
+*.pyc

@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -39,11 +40,13 @@ uint64_t monotonic_us() {
 }
 
 struct Options {
-    std::string device = "/dev/video-camera0";
+    std::string device = "/dev/video44";
+    std::string trace_csv;
     std::string format = "nv12";
-    uint32_t width = 1632;
-    uint32_t height = 1224;
-    uint32_t fps = 30;
+    uint32_t width = 1920;
+    uint32_t height = 1080;
+    uint32_t fps = 60;
+    uint32_t buffers = 6;
     uint32_t duration_seconds = 10;
     uint32_t queue_capacity = 4;
     uint32_t consumer_delay_ms = 0;
@@ -67,6 +70,8 @@ void print_usage(const char* program) {
         << "  --width N                 Requested width\n"
         << "  --height N                Requested height\n"
         << "  --fps N                   Requested frame rate\n"
+        << "  --buffers N               Requested MMAP buffers\n"
+        << "  --trace-csv PATH          Diagnostic sequence/timestamp CSV (no images)\n"
         << "  --duration N              Run duration in seconds\n"
         << "  --queue-capacity N        Bounded frame queue size\n"
         << "  --consumer-delay-ms N     Artificial sink delay for backpressure tests\n"
@@ -95,6 +100,10 @@ Options parse_options(int argc, char** argv) {
             options.height = parse_u32(value, "--height");
         } else if (argument == "--fps") {
             options.fps = parse_u32(value, "--fps");
+        } else if (argument == "--buffers") {
+            options.buffers = parse_u32(value, "--buffers");
+        } else if (argument == "--trace-csv") {
+            options.trace_csv = value;
         } else if (argument == "--duration") {
             options.duration_seconds = parse_u32(value, "--duration");
         } else if (argument == "--queue-capacity") {
@@ -137,6 +146,12 @@ void update_max(std::atomic<uint64_t>* target, uint64_t value) {
 int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
+        std::ofstream trace;
+        if (!options.trace_csv.empty()) {
+            trace.open(options.trace_csv);
+            if (!trace) throw std::runtime_error("Cannot open capture trace CSV");
+            trace << "sequence,driver_us,dequeue_us,flags,bytes\n";
+        }
         const uint32_t pixel_format = rkstream::parse_pixel_format(options.format);
 
         std::signal(SIGINT, handle_signal);
@@ -150,7 +165,7 @@ int main(int argc, char** argv) {
             options.height,
             options.fps,
             pixel_format,
-            4,
+            options.buffers,
         };
         if (!capture.open(config, &error)) {
             std::cerr << "capture open failed: " << error << '\n';
@@ -226,9 +241,15 @@ int main(int argc, char** argv) {
                     break;
                 }
 
-                if (have_previous_sequence && frame.sequence > previous_sequence + 1) {
+                if (trace.is_open()) {
+                    trace << frame.sequence << ',' << frame.driver_timestamp_us << ','
+                          << frame.dequeue_timestamp_us << ',' << frame.timestamp_flags << ','
+                          << frame.data.size() << '\n';
+                }
+                const uint32_t delta = frame.sequence - previous_sequence;
+                if (have_previous_sequence && delta > 1 && delta < 0x80000000U) {
                     counters.driver_sequence_gaps.fetch_add(
-                        frame.sequence - previous_sequence - 1, std::memory_order_relaxed);
+                        delta - 1, std::memory_order_relaxed);
                 }
                 previous_sequence = frame.sequence;
                 have_previous_sequence = true;

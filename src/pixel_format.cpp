@@ -16,6 +16,7 @@ uint32_t parse_pixel_format(const std::string& name) {
     if (normalized == "nv12") {
         return V4L2_PIX_FMT_NV12;
     }
+    if (normalized == "nv12m" || normalized == "nm12") return V4L2_PIX_FMT_NV12M;
     if (normalized == "yuyv" || normalized == "yuy2") {
         return V4L2_PIX_FMT_YUYV;
     }

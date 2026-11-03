@@ -1,6 +1,8 @@
 # RK3588 低延迟硬件视频流系统
 
-[![CI](https://github.com/xxgqiu/rk3588-low-latency-stream/actions/workflows/ci.yml/badge.svg)](https://github.com/xxgqiu/rk3588-low-latency-stream/actions/workflows/ci.yml)
+> EVM3588 / IMX415 适配入口：[本板操作与程序说明](README_EMA3588.md)、[本板实测](docs/EMA3588_VALIDATION.md)。本轮新增代码在 `ema3588/` 及已适配的 C++ 模块。下文保留原作者 OV8858 项目说明，其设备、参数和性能数字不能直接用于本板。
+
+[![CI](https://github.com/guozhe010702-boop/C-17-RTSP/actions/workflows/ci.yml/badge.svg)](https://github.com/guozhe010702-boop/C-17-RTSP/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](CMakeLists.txt)
 [![Platform](https://img.shields.io/badge/Platform-RK3588-brightgreen.svg)](docs/BUILD_AND_RUN.md)

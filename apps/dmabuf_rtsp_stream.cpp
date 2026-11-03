@@ -1,4 +1,5 @@
 #include "rkstream/annexb.h"
+#include "rkstream/pixel_format.h"
 #include "rkstream/bounded_latest_queue.h"
 #include "rkstream/dmabuf_queue_policy.h"
 #include "rkstream/keyframe_resync.h"
@@ -14,6 +15,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <future>
 #include <iomanip>
 #include <iostream>
@@ -71,12 +73,14 @@ double timeval_seconds(const timeval& value) {
 }
 
 struct Options {
-    std::string device = "/dev/video-camera0";
-    std::string url = "rtsp://127.0.0.1:8554/live";
+    std::string device = "/dev/video44";
+    uint32_t width = 1920, height = 1080, buffers = 6;
+    std::string format = "nv12";
+    std::string url = "rtsp://127.0.0.1:8556/imx415";
     uint32_t duration_seconds = 20;
-    uint32_t encoder_fps = 24;
-    uint32_t bitrate = 4'000'000;
-    uint32_t gop = 48;
+    uint32_t encoder_fps = 60;
+    uint32_t bitrate = 8'000'000;
+    uint32_t gop = 60;
     uint32_t frame_queue_capacity = 1;
     uint32_t packet_queue_capacity = 8;
     uint32_t encoder_delay_ms = 0;
@@ -96,9 +100,12 @@ uint32_t parse_u32(const char* value, const char* option, bool allow_zero = fals
 void print_usage(const char* program) {
     std::cout
         << "Usage: " << program << " [options]\n"
-        << "  --device PATH             OV8858 NV12 capture node\n"
+        << "  --device PATH             IMX415 NV12 capture node\n"
+        << "  --width N --height N       Requested capture dimensions\n"
+        << "  --buffers N                V4L2 MMAP buffer count\n"
+        << "  --format nv12|nv12m        CPU supports both; DMA requires contiguous NV12\n"
         << "  --url URL                 RTSP publication URL\n"
-        << "  --duration N              Run duration in seconds\n"
+        << "  --duration N              Run seconds; 0 means until SIGINT/SIGTERM\n"
         << "  --fps N                   Encoder frame rate\n"
         << "  --bitrate N               Target bitrate in bits/s\n"
         << "  --gop N                   H.264 GOP length\n"
@@ -122,10 +129,18 @@ Options parse_options(int argc, char** argv) {
         const char* value = argv[++index];
         if (argument == "--device") {
             options.device = value;
+        } else if (argument == "--width") {
+            options.width = parse_u32(value, "--width");
+        } else if (argument == "--height") {
+            options.height = parse_u32(value, "--height");
+        } else if (argument == "--buffers") {
+            options.buffers = parse_u32(value, "--buffers");
+        } else if (argument == "--format") {
+            options.format = value;
         } else if (argument == "--url") {
             options.url = value;
         } else if (argument == "--duration") {
-            options.duration_seconds = parse_u32(value, "--duration");
+            options.duration_seconds = parse_u32(value, "--duration", true);
         } else if (argument == "--fps") {
             options.encoder_fps = parse_u32(value, "--fps");
         } else if (argument == "--bitrate") {
@@ -194,6 +209,7 @@ struct SharedError {
 
 int main(int argc, char** argv) {
     try {
+        std::setvbuf(stdout, nullptr, _IOLBF, 0);
         const Options options = parse_options(argc, argv);
         std::signal(SIGINT, handle_signal);
         std::signal(SIGTERM, handle_signal);
@@ -203,13 +219,27 @@ int main(int argc, char** argv) {
         rkstream::V4L2DmabufCapture capture;
         std::string error;
         const rkstream::CaptureConfig capture_config{
-            options.device, 1632, 1224, 30, V4L2_PIX_FMT_NV12, 4,
+            options.device, options.width, options.height, options.encoder_fps,
+            rkstream::parse_pixel_format(options.format), options.buffers,
         };
         if (!capture.open(capture_config, &error)) {
             std::cerr << "V4L2 DMA-BUF initialization failed: " << error << '\n';
             return 2;
         }
         const rkstream::CaptureInfo capture_info = capture.info();
+        if (capture_info.width != options.width || capture_info.height != options.height ||
+            (capture_info.pixel_format != V4L2_PIX_FMT_NV12 && capture_info.pixel_format != V4L2_PIX_FMT_NV12M)) {
+            std::cerr << "Driver adjusted dimensions or returned non-NV12 format; refusing silent fallback\n";
+            return 2;
+        }
+        std::cout << "CAPTURE_INFO requested_fps=" << capture_info.requested_fps
+                  << " driver_fps_reported=" << capture_info.fps_reported
+                  << " driver_fps=" << capture_info.fps_numerator << '/' << capture_info.fps_denominator
+                  << " width=" << capture_info.width << " height=" << capture_info.height
+                  << " stride=" << capture_info.bytes_per_line << " planes=" << capture_info.plane_count
+                  << " sizeimage=" << capture_info.size_image
+                  << " format=" << rkstream::pixel_format_name(capture_info.pixel_format) << '\n';
+
         // encoder 在短暂 RGA 阶段持有 1 帧。队列外必须再为 RKISP 保留至少 2 个
         // buffer；4-buffer 相机因此只能使用容量为 1 的 lease queue。
         if (!rkstream::valid_dmabuf_lease_queue_capacity(
@@ -241,14 +271,9 @@ int main(int argc, char** argv) {
             std::cerr << "RGA initialization failed: " << error << '\n';
             return 3;
         }
-        if (!capture.start(&error)) {
-            std::cerr << "V4L2 stream start failed: " << error << '\n';
-            return 2;
-        }
-
         // frame_queue 连接 capture/encoder；packet_queue 连接 encoder/network。
         // 容量是固定上限，所以无论运行 20 秒还是 20 小时都不会无限积压。
-        rkstream::BoundedLatestQueue<rkstream::DmabufFrame> frame_queue(
+        rkstream::BoundedLatestQueue<rkstream::DmabufFrameLease> frame_queue(
             options.frame_queue_capacity);
         rkstream::BoundedLatestQueue<rkstream::EncodedPacket> packet_queue(
             options.packet_queue_capacity);
@@ -256,17 +281,18 @@ int main(int argc, char** argv) {
         SharedError shared_error;
         std::atomic<bool> stop{false};
         std::atomic<bool> fatal{false};
-        const auto started_at = std::chrono::steady_clock::now();
-        const auto deadline = started_at + std::chrono::seconds(options.duration_seconds);
+        auto started_at = std::chrono::steady_clock::now();
+        auto deadline = options.duration_seconds == 0 ? std::chrono::steady_clock::time_point::max()
+            : started_at + std::chrono::seconds(options.duration_seconds);
         rusage usage_start{};
         (void)getrusage(RUSAGE_SELF, &usage_start);
 
         // 所有 lease 归还都走同一个入口，统一计数和故障升级。
         // 正常 RGA、drop-oldest、push 被拒绝、停机 drain 四条路径都要调用它。
-        auto release_lease = [&](const rkstream::DmabufFrame& frame,
+        auto release_lease = [&](rkstream::DmabufFrameLease& frame,
                                  const char* context) -> bool {
             std::string release_error;
-            if (!capture.release(frame, &release_error)) {
+            if (!frame.release(&release_error)) {
                 counters.lease_release_failures.fetch_add(1, std::memory_order_relaxed);
                 shared_error.set(std::string(context) + ": " + release_error);
                 fatal.store(true, std::memory_order_relaxed);
@@ -348,6 +374,19 @@ int main(int argc, char** argv) {
             capture.close();
             std::cerr << shared_error.get() << '\n';
             return 4;
+        }
+
+        // Start capture only once its downstream consumer is ready. Otherwise
+        // RTSP setup can fill all camera slots before the first DQBUF.
+        started_at = std::chrono::steady_clock::now();
+        deadline = options.duration_seconds == 0 ? std::chrono::steady_clock::time_point::max()
+            : started_at + std::chrono::seconds(options.duration_seconds);
+        (void)getrusage(RUSAGE_SELF, &usage_start);
+        if (!capture.start(&error)) {
+            packet_queue.close();
+            network_thread.join();
+            std::cerr << "V4L2 stream start failed: " << error << '\n';
+            return 2;
         }
 
         std::cout << "DMABUF_STREAM_READY"
@@ -461,9 +500,10 @@ int main(int argc, char** argv) {
                     break;
                 }
 
+                rkstream::DmabufFrameLease lease(capture, frame);
                 if (have_previous_sequence) {
                     const uint32_t delta = frame.sequence - previous_sequence;
-                    if (delta > 1) {
+                    if (delta > 1 && delta < 0x80000000U) {
                         counters.driver_sequence_gaps.fetch_add(delta - 1,
                                                                  std::memory_order_relaxed);
                     }
@@ -472,13 +512,9 @@ int main(int argc, char** argv) {
                 have_previous_sequence = true;
                 counters.captured.fetch_add(1, std::memory_order_relaxed);
 
-                // push 会移动 frame；先保留轻量描述，以便队列已关闭时仍能 release。
-                const rkstream::DmabufFrame current = frame;
-                auto push_result = frame_queue.push(std::move(frame));
-                if (!push_result.accepted) {
-                    (void)release_lease(current, "release rejected frame");
-                    break;
-                }
+                // The rejected push destroys its move-only lease and QBUFs automatically.
+                auto push_result = frame_queue.push(std::move(lease));
+                if (!push_result.accepted) break;
                 // drop-oldest 返回的 lease 已从队列移出，但仍属于应用，必须立即 QBUF。
                 if (push_result.dropped_value.has_value()) {
                     counters.leases_dropped_oldest.fetch_add(1,
@@ -501,9 +537,10 @@ int main(int argc, char** argv) {
                 continue;
             }
             std::cout << "DMABUF_STATUS"
+                      << " sample_us=" << monotonic_us()
                       << " captured=" << counters.captured.load(std::memory_order_relaxed)
                       << " released="
-                      << counters.leases_released.load(std::memory_order_relaxed)
+                      << capture.released_count()
                       << " encoded=" << counters.encoded.load(std::memory_order_relaxed)
                       << " published=" << counters.published.load(std::memory_order_relaxed)
                       << " frame_queue=" << frame_queue.size() << '/'
@@ -525,7 +562,7 @@ int main(int argc, char** argv) {
 
         // encoder 可能因网络关闭或编码错误提前退出；此时队列中的 lease 必须人工归还。
         auto remaining_frames = frame_queue.drain();
-        for (const auto& frame : remaining_frames) {
+        for (auto& frame : remaining_frames) {
             counters.leases_drained.fetch_add(1, std::memory_order_relaxed);
             (void)release_lease(frame, "release drained frame");
         }
@@ -546,7 +583,7 @@ int main(int argc, char** argv) {
         const double system_cpu_s = timeval_seconds(usage_end.ru_stime) -
                                     timeval_seconds(usage_start.ru_stime);
         const uint64_t captured = counters.captured.load(std::memory_order_relaxed);
-        const uint64_t released = counters.leases_released.load(std::memory_order_relaxed);
+        const uint64_t released = capture.released_count();
         const uint64_t rga_completed = counters.rga_completed.load(std::memory_order_relaxed);
         const uint64_t encoded = counters.encoded.load(std::memory_order_relaxed);
         const uint64_t published = counters.published.load(std::memory_order_relaxed);
@@ -555,7 +592,7 @@ int main(int argc, char** argv) {
         // captured == released 是 DMA-BUF 路径最重要的不变量。即使视频可播放，只要
         // outstanding_leases 非零，也说明某条异常/停机路径存在资源所有权缺陷。
         const bool lease_balance = outstanding_leases == 0 &&
-            counters.lease_release_failures.load(std::memory_order_relaxed) == 0;
+            capture.release_failures() == 0;
         const bool pass = !fatal.load(std::memory_order_relaxed) && lease_balance;
 
         std::cout << std::fixed << std::setprecision(3)
@@ -570,7 +607,7 @@ int main(int argc, char** argv) {
                   << " leases_drained="
                   << counters.leases_drained.load(std::memory_order_relaxed)
                   << " lease_release_failures="
-                  << counters.lease_release_failures.load(std::memory_order_relaxed)
+                  << capture.release_failures()
                   << " rga_completed=" << rga_completed
                   << " encoded=" << encoded
                   << " published=" << published

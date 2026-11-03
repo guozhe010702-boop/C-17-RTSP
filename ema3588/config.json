@@ -1,0 +1,14 @@
+{
+  "device": "/dev/video44",
+  "width": 1920,
+  "height": 1080,
+  "fps": 60,
+  "buffers": 6,
+  "format": "nv12",
+  "bitrate": 8000000,
+  "gop": 60,
+  "frame_queue": 1,
+  "packet_queue": 8,
+  "rtsp_port": 8556,
+  "path": "imx415"
+}

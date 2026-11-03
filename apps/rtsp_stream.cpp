@@ -1,4 +1,5 @@
 #include "rkstream/annexb.h"
+#include "rkstream/pixel_format.h"
 #include "rkstream/bounded_latest_queue.h"
 #include "rkstream/frame.h"
 #include "rkstream/keyframe_resync.h"
@@ -13,6 +14,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <future>
 #include <iomanip>
 #include <iostream>
@@ -56,21 +58,23 @@ void update_max(std::atomic<uint64_t>* target, uint64_t value) {
 }
 
 struct Options {
-    std::string device = "/dev/video-camera0";
-    std::string url = "rtsp://127.0.0.1:8554/live";
+    std::string device = "/dev/video44";
+    uint32_t width = 1920, height = 1080, buffers = 6;
+    std::string format = "nv12";
+    std::string url = "rtsp://127.0.0.1:8556/imx415";
     uint32_t duration_seconds = 20;
-    uint32_t encoder_fps = 24;
-    uint32_t bitrate = 4'000'000;
-    uint32_t gop = 48;
-    uint32_t frame_queue_capacity = 4;
+    uint32_t encoder_fps = 60;
+    uint32_t bitrate = 8'000'000;
+    uint32_t gop = 60;
+    uint32_t frame_queue_capacity = 1;
     uint32_t packet_queue_capacity = 8;
 };
 
-uint32_t parse_u32(const char* value, const char* option) {
+uint32_t parse_u32(const char* value, const char* option, bool allow_zero = false) {
     const std::string text(value);
     std::size_t consumed = 0;
     const unsigned long parsed = std::stoul(text, &consumed, 10);
-    if (consumed != text.size() || parsed == 0 ||
+    if (consumed != text.size() || (!allow_zero && parsed == 0) ||
         parsed > std::numeric_limits<uint32_t>::max()) {
         throw std::invalid_argument(std::string("invalid value for ") + option + ": " + text);
     }
@@ -81,8 +85,11 @@ void print_usage(const char* program) {
     std::cout
         << "Usage: " << program << " [options]\n"
         << "  --device PATH             NV12 V4L2 capture node\n"
+        << "  --width N --height N       Requested capture dimensions\n"
+        << "  --buffers N                V4L2 MMAP buffer count\n"
+        << "  --format nv12|nv12m        CPU supports both; DMA requires contiguous NV12\n"
         << "  --url URL                 RTSP publication URL\n"
-        << "  --duration N              Run duration in seconds\n"
+        << "  --duration N              Run seconds; 0 means until SIGINT/SIGTERM\n"
         << "  --fps N                   Encoder frame rate\n"
         << "  --bitrate N               Target bitrate in bits/s\n"
         << "  --gop N                   H.264 GOP length\n"
@@ -105,10 +112,18 @@ Options parse_options(int argc, char** argv) {
         const char* value = argv[++index];
         if (argument == "--device") {
             options.device = value;
+        } else if (argument == "--width") {
+            options.width = parse_u32(value, "--width");
+        } else if (argument == "--height") {
+            options.height = parse_u32(value, "--height");
+        } else if (argument == "--buffers") {
+            options.buffers = parse_u32(value, "--buffers");
+        } else if (argument == "--format") {
+            options.format = value;
         } else if (argument == "--url") {
             options.url = value;
         } else if (argument == "--duration") {
-            options.duration_seconds = parse_u32(value, "--duration");
+            options.duration_seconds = parse_u32(value, "--duration", true);
         } else if (argument == "--fps") {
             options.encoder_fps = parse_u32(value, "--fps");
         } else if (argument == "--bitrate") {
@@ -166,6 +181,7 @@ struct SharedError {
 
 int main(int argc, char** argv) {
     try {
+        std::setvbuf(stdout, nullptr, _IOLBF, 0);
         const Options options = parse_options(argc, argv);
         std::signal(SIGINT, handle_signal);
         std::signal(SIGTERM, handle_signal);
@@ -174,13 +190,27 @@ int main(int argc, char** argv) {
         rkstream::V4L2Capture capture;
         std::string error;
         const rkstream::CaptureConfig capture_config{
-            options.device, 1632, 1224, 30, V4L2_PIX_FMT_NV12, 4,
+            options.device, options.width, options.height, options.encoder_fps,
+            rkstream::parse_pixel_format(options.format), options.buffers,
         };
-        if (!capture.open(capture_config, &error) || !capture.start(&error)) {
+        if (!capture.open(capture_config, &error)) {
             std::cerr << "V4L2 initialization failed: " << error << '\n';
             return 2;
         }
         const rkstream::CaptureInfo capture_info = capture.info();
+        if (capture_info.width != options.width || capture_info.height != options.height ||
+            (capture_info.pixel_format != V4L2_PIX_FMT_NV12 && capture_info.pixel_format != V4L2_PIX_FMT_NV12M)) {
+            std::cerr << "Driver adjusted dimensions or returned non-NV12 format; refusing silent fallback\n";
+            return 2;
+        }
+        std::cout << "CAPTURE_INFO requested_fps=" << capture_info.requested_fps
+                  << " driver_fps_reported=" << capture_info.fps_reported
+                  << " driver_fps=" << capture_info.fps_numerator << '/' << capture_info.fps_denominator
+                  << " width=" << capture_info.width << " height=" << capture_info.height
+                  << " stride=" << capture_info.bytes_per_line << " planes=" << capture_info.plane_count
+                  << " sizeimage=" << capture_info.size_image
+                  << " format=" << rkstream::pixel_format_name(capture_info.pixel_format) << '\n';
+
 
         rkstream::MppH264Encoder encoder;
         const rkstream::MppEncoderConfig encoder_config{
@@ -204,8 +234,12 @@ int main(int argc, char** argv) {
         SharedError shared_error;
         std::atomic<bool> stop{false};
         std::atomic<bool> fatal{false};
-        const auto started_at = std::chrono::steady_clock::now();
-        const auto deadline = started_at + std::chrono::seconds(options.duration_seconds);
+        auto started_at = std::chrono::steady_clock::now();
+        auto deadline = options.duration_seconds == 0 ? std::chrono::steady_clock::time_point::max()
+            : started_at + std::chrono::seconds(options.duration_seconds);
+
+        rusage usage_start{};
+        (void)getrusage(RUSAGE_SELF, &usage_start);
 
         // 网络初始化屏障，语义与优化版一致。
         std::promise<bool> publisher_ready_promise;
@@ -274,6 +308,18 @@ int main(int argc, char** argv) {
             encoder.close();
             std::cerr << shared_error.get() << '\n';
             return 4;
+        }
+
+        // Do not fill camera buffers while MPP/RTSP are still initializing.
+        started_at = std::chrono::steady_clock::now();
+        deadline = options.duration_seconds == 0 ? std::chrono::steady_clock::time_point::max()
+            : started_at + std::chrono::seconds(options.duration_seconds);
+        (void)getrusage(RUSAGE_SELF, &usage_start);
+        if (!capture.start(&error)) {
+            packet_queue.close();
+            network_thread.join();
+            std::cerr << "V4L2 stream start failed: " << error << '\n';
+            return 2;
         }
 
         std::cout << "STREAM_READY"
@@ -376,6 +422,7 @@ int main(int argc, char** argv) {
                 std::chrono::steady_clock::now() - started_at).count();
             std::cout << std::fixed << std::setprecision(2)
                       << "STATUS elapsed_s=" << elapsed_s
+                      << " sample_us=" << monotonic_us()
                       << " captured=" << counters.captured.load(std::memory_order_relaxed)
                       << " encoded=" << counters.encoded.load(std::memory_order_relaxed)
                       << " published=" << counters.published.load(std::memory_order_relaxed)
@@ -404,13 +451,14 @@ int main(int argc, char** argv) {
         const uint64_t published = counters.published.load(std::memory_order_relaxed);
         rusage usage{};
         (void)getrusage(RUSAGE_SELF, &usage);
-        const double user_cpu_s = usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1'000'000.0;
-        const double system_cpu_s = usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1'000'000.0;
+        const double user_cpu_s = (usage.ru_utime.tv_sec - usage_start.ru_utime.tv_sec) + (usage.ru_utime.tv_usec - usage_start.ru_utime.tv_usec) / 1'000'000.0;
+        const double system_cpu_s = (usage.ru_stime.tv_sec - usage_start.ru_stime.tv_sec) + (usage.ru_stime.tv_usec - usage_start.ru_stime.tv_usec) / 1'000'000.0;
         std::cout << std::fixed << std::setprecision(3)
                   << "STREAM_SUMMARY result="
                   << (fatal.load(std::memory_order_relaxed) ? "FAIL" : "PASS")
                   << " elapsed_s=" << elapsed_s
-                  << " captured=" << counters.captured.load(std::memory_order_relaxed)
+                  << " sample_us=" << monotonic_us()
+                      << " captured=" << counters.captured.load(std::memory_order_relaxed)
                   << " encoded=" << encoded
                   << " published=" << published
                   << " stream_fps=" << (elapsed_s > 0 ? published / elapsed_s : 0.0)

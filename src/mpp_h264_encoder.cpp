@@ -45,7 +45,10 @@ public:
     bool open(const MppEncoderConfig& config, std::string* error) {
         close();
         if (config.width == 0 || config.height == 0 || config.source_stride < config.width ||
-            config.fps == 0 || config.bitrate == 0 || config.gop == 0) {
+            config.fps == 0 || config.bitrate == 0 || config.gop == 0 ||
+            (config.width & 1U) || (config.height & 1U) ||
+            config.width > 3840 || config.height > 2160 || config.fps > 60 ||
+            config.bitrate > 200'000'000) {
             if (error != nullptr) {
                 *error = "invalid MPP encoder configuration";
             }
@@ -84,6 +87,14 @@ public:
             close();
             return false;
         }
+        // Bound hardware waits; a stopped device must not hang shutdown forever.
+        RK_S64 timeout_ms = 3000;  // MPP_SET_OUTPUT_TIMEOUT requires RK_S64, not enum/int.
+        result = api_->control(context_, MPP_SET_OUTPUT_TIMEOUT, &timeout_ms);
+        if (result != MPP_OK) {
+            if (error) *error = mpp_error("MPP_SET_OUTPUT_TIMEOUT", result);
+            close();
+            return false;
+        }
         result = mpp_enc_cfg_init(&encoder_config_);
         if (result != MPP_OK) {
             if (error != nullptr) {
@@ -98,6 +109,12 @@ public:
         const int32_t bitrate = static_cast<int32_t>(config.bitrate);
         const int32_t minimum_bitrate = static_cast<int32_t>(config.bitrate * 9ULL / 10ULL);
         const int32_t maximum_bitrate = static_cast<int32_t>(config.bitrate * 11ULL / 10ULL);
+        const uint64_t macroblocks = static_cast<uint64_t>((config.width + 15) / 16) *
+                                     ((config.height + 15) / 16);
+        const uint64_t macroblocks_per_second = macroblocks * config.fps;
+        const int level = macroblocks <= 8192 && macroblocks_per_second <= 245760 ? 40
+            : macroblocks <= 8704 && macroblocks_per_second <= 522240 ? 42
+            : macroblocks_per_second <= 983040 ? 51 : 52;
         const bool configured =
             set_config(encoder_config_, "prep:width", static_cast<int32_t>(config.width), error) &&
             set_config(encoder_config_, "prep:height", static_cast<int32_t>(config.height), error) &&
@@ -118,7 +135,7 @@ public:
             set_config(encoder_config_, "rc:fps_out_denom", 1, error) &&
             set_config(encoder_config_, "rc:gop", static_cast<int32_t>(config.gop), error) &&
             set_config(encoder_config_, "h264:profile", 100, error) &&
-            set_config(encoder_config_, "h264:level", 40, error) &&
+            set_config(encoder_config_, "h264:level", level, error) &&
             set_config(encoder_config_, "h264:cabac_en", 1, error) &&
             set_config(encoder_config_, "h264:cabac_idc", 0, error);
         if (!configured) {
@@ -135,8 +152,13 @@ public:
             return false;
         }
 
-        MppEncHeaderMode header_mode = MPP_ENC_HEADER_MODE_DEFAULT;
-        (void)api_->control(context_, MPP_ENC_SET_HEADER_MODE, &header_mode);
+        MppEncHeaderMode header_mode = MPP_ENC_HEADER_MODE_EACH_IDR;
+        result = api_->control(context_, MPP_ENC_SET_HEADER_MODE, &header_mode);
+        if (result != MPP_OK) {
+            if (error) *error = mpp_error("MPP_ENC_SET_HEADER_MODE", result);
+            close();
+            return false;
+        }
 
         // 3. 分配固定大小的 MPP DMA 缓冲。整个运行期间复用，避免每帧分配。
         //    input 可由 CPU 映射写入，也可把 fd 借给 RGA；output 保存一帧编码结果。
